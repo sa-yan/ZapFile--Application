@@ -16,6 +16,7 @@ import {
 
 import * as api from '@/lib/api';
 import { zapWs } from '@/lib/ws';
+import { useAuth } from '@/store/auth';
 import { useTransfers } from '@/store/transfers';
 import type { TransferResponse } from '@/types/api';
 
@@ -412,6 +413,33 @@ zapWs.on('signal.sdp-answer', (data: { transferId: string; sdp: any }) => {
   setRemote(data.transferId, data.sdp).catch((e) =>
     fail(data.transferId, e instanceof Error ? e.message : 'bad answer'),
   );
+});
+
+// On (re)connect, deal with accepted transfers this sender never started —
+// e.g. the receiver accepted while our app was closed. Resume the ones whose
+// file we still know; fail the orphans so they don't sit at 0% forever.
+zapWs.on('ws.connected', async () => {
+  try {
+    await useTransfers.getState().refresh();
+  } catch {}
+  const me = useAuth.getState().user?.userId;
+  if (!me) return;
+  const { transfers, localFiles } = useTransfers.getState();
+  for (const t of transfers) {
+    const stuck =
+      (t.status === 'ACCEPTED' || t.status === 'IN_PROGRESS') &&
+      t.senderUserId === me &&
+      !sessions.has(t.id);
+    if (!stuck) continue;
+    if (localFiles[t.id]) {
+      console.log(`[transfer ${t.id}] resuming pending send after reconnect`);
+      startSending(t).catch((e) =>
+        fail(t.id, e instanceof Error ? e.message : 'could not resume sending'),
+      );
+    } else {
+      fail(t.id, 'local file no longer known (stale transfer)');
+    }
+  }
 });
 
 zapWs.on('signal.ice-candidate', (data: { transferId: string; candidate: any }) => {

@@ -252,6 +252,7 @@ function OutgoingOfferCard({ batch }: { batch: Batch }) {
 }
 
 function ActiveRow({ transfer, myUserId }: { transfer: TransferResponse; myUserId: string }) {
+  const cancelOffer = useTransfers((s) => s.cancelOffer);
   const sent = transfer.senderUserId === myUserId;
   return (
     <ThemedView type="backgroundElement" style={[styles.card, styles.rowCard]}>
@@ -269,6 +270,11 @@ function ActiveRow({ transfer, myUserId }: { transfer: TransferResponse; myUserI
           {sent ? `Sending to ${transfer.receiverDisplayName}` : `Receiving from ${transfer.senderDisplayName}`}
         </ThemedText>
       </View>
+      <Pressable onPress={() => cancelOffer(transfer.batchId)} hitSlop={Spacing.three}>
+        <ThemedText type="subtitle" themeColor="textSecondary" style={styles.cancelX}>
+          ×
+        </ThemedText>
+      </Pressable>
     </ThemedView>
   );
 }
@@ -558,6 +564,10 @@ const styles = StyleSheet.create({
   },
   flex1: {
     flex: 1,
+  },
+  cancelX: {
+    lineHeight: 32,
+    paddingHorizontal: Spacing.two,
   },
   rowThumbnail: {
     width: 56,
