@@ -1,5 +1,13 @@
 import { Directory, File, Paths } from 'expo-file-system';
+import {
+  readAsStringAsync,
+  StorageAccessFramework as SAF,
+  writeAsStringAsync,
+} from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
+import { Platform } from 'react-native';
+
+import * as storage from '@/lib/storage';
 import {
   RTCIceCandidate,
   RTCPeerConnection,
@@ -214,6 +222,44 @@ async function pumpFile(channel: any, transfer: TransferResponse, uri: string) {
   // keep the session open until the receiver acks with "received"
 }
 
+const DOWNLOADS_DIR_KEY = 'zapfile.downloadsDirUri';
+/** Base64 copy holds the file in memory; skip enormous files. */
+const MAX_PUBLIC_COPY_BYTES = 128 * 1024 * 1024;
+
+/**
+ * Copies every received file into the user's Downloads folder so it shows up
+ * in the Files app. The first call opens Android's picker pointed at
+ * Downloads — the user confirms once; afterwards copies are silent.
+ */
+async function saveToDownloads(
+  uri: string,
+  fileName: string,
+  mimeType: string | null,
+  size: number,
+): Promise<boolean> {
+  if (Platform.OS !== 'android' || size > MAX_PUBLIC_COPY_BYTES) return false;
+  try {
+    let dir = await storage.getItem(DOWNLOADS_DIR_KEY);
+    if (!dir) {
+      const perm = await SAF.requestDirectoryPermissionsAsync(
+        SAF.getUriForDirectoryInRoot('Download'),
+      );
+      if (!perm.granted) return false;
+      dir = perm.directoryUri;
+      await storage.setItem(DOWNLOADS_DIR_KEY, dir);
+    }
+    const dest = await SAF.createFileAsync(dir, fileName, mimeType ?? 'application/octet-stream');
+    const base64 = await readAsStringAsync(uri, { encoding: 'base64' });
+    await writeAsStringAsync(dest, base64, { encoding: 'base64' });
+    return true;
+  } catch (e) {
+    console.warn('downloads save failed:', e instanceof Error ? e.message : e);
+    // permission may have been revoked — forget the folder so we re-ask next time
+    await storage.deleteItem(DOWNLOADS_DIR_KEY).catch(() => {});
+    return false;
+  }
+}
+
 /** Copies received photos/videos into the device gallery. Best-effort. */
 async function saveToGallery(uri: string, mimeType: string | null): Promise<boolean> {
   if (!mimeType || !(mimeType.startsWith('image/') || mimeType.startsWith('video/'))) {
@@ -263,6 +309,13 @@ function receiveChannel(channel: any, transferId: string) {
           const doneMeta = meta;
           if (doneMeta && doneFile) {
             const inGallery = await saveToGallery(doneFile.uri, doneMeta.mimeType);
+            // everything also lands in the user's Downloads folder
+            const inDownloads = await saveToDownloads(
+              doneFile.uri,
+              doneMeta.fileName,
+              doneMeta.mimeType,
+              doneMeta.fileSize,
+            );
             useTransfers.setState((s) => ({
               receivedFiles: {
                 ...s.receivedFiles,
@@ -271,11 +324,17 @@ function receiveChannel(channel: any, transferId: string) {
                   fileName: doneMeta.fileName,
                   mimeType: doneMeta.mimeType,
                   inGallery,
+                  inDownloads,
                 },
               },
             }));
           }
           console.log(`[transfer ${transferId}] file received (${received} bytes), completing`);
+          useTransfers.setState((s) => ({
+            transfers: s.transfers.map((t) =>
+              t.id === transferId ? { ...t, status: 'COMPLETED', bytesTransferred: received } : t,
+            ),
+          }));
           channel.send(JSON.stringify({ kind: 'received' }));
           // the bytes are on disk — a flaky complete call must not fail the transfer
           let completed = false;

@@ -1,9 +1,13 @@
 import { create } from 'zustand';
 
 import * as api from '@/lib/api';
+import { loadJson, saveJson } from '@/lib/json-store';
 import { zapWs } from '@/lib/ws';
 import { useAuth } from '@/store/auth';
 import type { FileMeta, TransferResponse } from '@/types/api';
+
+const LOCAL_FILES_STORE = 'local-files.json';
+const RECEIVED_FILES_STORE = 'received-files.json';
 
 /** One batch = one offer: the unit the user accepts or declines. */
 export interface Batch {
@@ -22,6 +26,8 @@ export interface ReceivedFile {
   mimeType: string | null;
   /** true if a copy was saved to the device gallery */
   inGallery?: boolean;
+  /** true if a copy was saved to the user-picked downloads folder */
+  inDownloads?: boolean;
 }
 
 interface TransfersState {
@@ -67,10 +73,26 @@ export function outgoingOffers(transfers: TransferResponse[], myUserId: string):
   );
 }
 
+const TERMINAL = new Set<TransferResponse['status']>([
+  'COMPLETED',
+  'DECLINED',
+  'CANCELLED',
+  'FAILED',
+]);
+
+type SetState = (fn: (s: TransfersState) => Partial<TransfersState>) => void;
+
+function setBatchStatus(set: SetState, batchId: string, status: TransferResponse['status']) {
+  set((s) => ({
+    error: null,
+    transfers: s.transfers.map((t) => (t.batchId === batchId ? { ...t, status } : t)),
+  }));
+}
+
 export const useTransfers = create<TransfersState>((set, get) => ({
   transfers: [],
-  localFiles: {},
-  receivedFiles: {},
+  localFiles: loadJson<Record<string, string>>(LOCAL_FILES_STORE) ?? {},
+  receivedFiles: loadJson<Record<string, ReceivedFile>>(RECEIVED_FILES_STORE) ?? {},
   loading: false,
   error: null,
 
@@ -78,7 +100,22 @@ export const useTransfers = create<TransfersState>((set, get) => ({
     set({ loading: true, error: null });
     try {
       const transfers = await api.transferHistory();
-      set({ transfers, loading: false });
+      // The server can briefly lag behind what this device already knows
+      // (final progress / complete calls still in flight), so never move a
+      // transfer backwards: keep local terminal statuses and higher byte
+      // counts until the server catches up.
+      set((s) => ({
+        transfers: transfers.map((t) => {
+          const local = s.transfers.find((x) => x.id === t.id);
+          if (!local) return t;
+          return {
+            ...t,
+            status: TERMINAL.has(local.status) && !TERMINAL.has(t.status) ? local.status : t.status,
+            bytesTransferred: Math.max(t.bytesTransferred, local.bytesTransferred),
+          };
+        }),
+        loading: false,
+      }));
     } catch (e) {
       set({ loading: false, error: e instanceof Error ? e.message : 'Could not load transfers' });
     }
@@ -110,35 +147,48 @@ export const useTransfers = create<TransfersState>((set, get) => ({
   acceptOffer: async (batchId) => {
     const deviceId = useAuth.getState().deviceId;
     if (!deviceId) return;
-    set({ error: null });
+    // optimistic: swap the offer card for the progress row immediately
+    setBatchStatus(set, batchId, 'ACCEPTED');
     try {
       await api.acceptBatch(batchId, deviceId);
       await get().refresh();
     } catch (e) {
       set({ error: e instanceof Error ? e.message : 'Could not accept the transfer' });
+      await get().refresh(); // revert the optimistic change
     }
   },
 
   declineOffer: async (batchId) => {
-    set({ error: null });
+    setBatchStatus(set, batchId, 'DECLINED');
     try {
       await api.declineBatch(batchId);
       await get().refresh();
     } catch (e) {
       set({ error: e instanceof Error ? e.message : 'Could not decline the transfer' });
+      await get().refresh();
     }
   },
 
   cancelOffer: async (batchId) => {
-    set({ error: null });
+    setBatchStatus(set, batchId, 'CANCELLED');
     try {
       await api.cancelBatch(batchId);
       await get().refresh();
     } catch (e) {
       set({ error: e instanceof Error ? e.message : 'Could not cancel the transfer' });
+      await get().refresh();
     }
   },
 }));
+
+// Persist the file maps so received files stay openable (and pending sends
+// stay resumable) across app restarts.
+useTransfers.subscribe((state, prev) => {
+  if (state.localFiles !== prev.localFiles) saveJson(LOCAL_FILES_STORE, state.localFiles);
+  if (state.receivedFiles !== prev.receivedFiles) {
+    saveJson(RECEIVED_FILES_STORE, state.receivedFiles);
+  }
+});
 
 // The server pushes a transfer.* event to both sides on every state change;
 // the REST list stays the single source of truth, the push just tells us when

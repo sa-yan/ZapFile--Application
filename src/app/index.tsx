@@ -22,6 +22,7 @@ import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Accent, MaxContentWidth, Spacing } from '@/constants/theme';
 import { formatBytes } from '@/lib/format';
+import { openFile } from '@/lib/open-file';
 import { zapWs } from '@/lib/ws';
 import { useAuth } from '@/store/auth';
 import { useFriends } from '@/store/friends';
@@ -292,8 +293,13 @@ function HistoryItem({ transfer, myUserId }: { transfer: TransferResponse; myUse
     }).catch(() => {});
   };
 
+  const open = () => {
+    if (!received) return;
+    openFile(received.uri, received.mimeType, received.fileName);
+  };
+
   return (
-    <Pressable style={styles.historyRow} onPress={received ? share : undefined}>
+    <Pressable style={styles.historyRow} onPress={received ? open : undefined}>
       {received?.mimeType?.startsWith('image/') ? (
         <Image source={{ uri: received.uri }} style={styles.rowThumbnail} contentFit="cover" />
       ) : (
@@ -308,16 +314,19 @@ function HistoryItem({ transfer, myUserId }: { transfer: TransferResponse; myUse
           {transfer.fileName}
         </ThemedText>
         <ThemedText type="small" themeColor="textSecondary" numberOfLines={1}>
-          {sent ? `To ${other}` : `From ${other}`} · {formatBytes(transfer.fileSize)} ·{' '}
+          {sent ? `To ${other}` : `From ${other}`} · {formatBytes(transfer.fileSize)}
+          {received?.inGallery ? ' · in gallery' : received?.inDownloads ? ' · in Downloads' : ''} ·{' '}
           <ThemedText type="small" style={{ color: failed ? '#e5484d' : '#30a46c' }}>
             {statusWord}
           </ThemedText>
         </ThemedText>
       </View>
       {received && (
-        <ThemedText type="small" style={{ color: Accent }}>
-          Share
-        </ThemedText>
+        <Pressable onPress={share} hitSlop={Spacing.two}>
+          <ThemedText type="small" style={{ color: Accent }}>
+            Share
+          </ThemedText>
+        </Pressable>
       )}
     </Pressable>
   );
