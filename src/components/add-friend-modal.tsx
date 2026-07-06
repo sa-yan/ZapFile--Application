@@ -10,10 +10,14 @@ import {
   View,
 } from 'react-native';
 
+import QRCode from 'react-native-qrcode-svg';
+
 import { Avatar } from '@/components/avatar';
+import { QrScannerModal } from '@/components/qr-scanner-modal';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Accent, Spacing } from '@/constants/theme';
+import { buildPairLink } from '@/lib/pair-link';
 import { useFriends } from '@/store/friends';
 
 interface Props {
@@ -27,6 +31,7 @@ export function AddFriendModal({ visible, onClose }: Props) {
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [scanOpen, setScanOpen] = useState(false);
   const dark = useColorScheme() === 'dark';
 
   const shareCode = () => {
@@ -34,17 +39,22 @@ export function AddFriendModal({ visible, onClose }: Props) {
     Share.share({ message: `Add me on ZapFile with pairing code: ${myCode.code}` });
   };
 
-  const redeem = async () => {
+  const redeem = async (code: string) => {
     setBusy(true);
     setError(null);
     try {
-      await redeemCode(input);
+      await redeemCode(code);
       setInput('');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Invalid code');
     } finally {
       setBusy(false);
     }
+  };
+
+  const onScanned = (code: string) => {
+    setScanOpen(false);
+    redeem(code);
   };
 
   return (
@@ -55,12 +65,20 @@ export function AddFriendModal({ visible, onClose }: Props) {
         <ThemedText type="subtitle">Add a friend</ThemedText>
 
         {myCode ? (
-          <Pressable onPress={shareCode}>
+          <Pressable onPress={shareCode} style={styles.qrBlock}>
+            <View style={styles.qrBox}>
+              <QRCode
+                value={buildPairLink(myCode.code)}
+                size={160}
+                backgroundColor="#fff"
+                color="#111"
+              />
+            </View>
             <ThemedText type="subtitle" style={styles.code}>
               {myCode.code}
             </ThemedText>
             <ThemedText type="small" themeColor="textSecondary" style={styles.centered}>
-              Tap to share your code
+              Have a friend scan this, or tap to share the code
             </ThemedText>
           </Pressable>
         ) : (
@@ -82,7 +100,7 @@ export function AddFriendModal({ visible, onClose }: Props) {
           <Pressable
             style={[styles.button, (!input.trim() || busy) && styles.buttonDisabled]}
             disabled={!input.trim() || busy}
-            onPress={redeem}>
+            onPress={() => redeem(input)}>
             {busy ? (
               <ActivityIndicator color="#fff" />
             ) : (
@@ -90,6 +108,13 @@ export function AddFriendModal({ visible, onClose }: Props) {
             )}
           </Pressable>
         </View>
+
+        <Pressable
+          style={[styles.scanButton, busy && styles.buttonDisabled]}
+          disabled={busy}
+          onPress={() => setScanOpen(true)}>
+          <ThemedText style={styles.scanButtonText}>Scan a friend&apos;s QR code</ThemedText>
+        </Pressable>
 
         {error && (
           <ThemedText type="small" style={styles.error}>
@@ -121,6 +146,7 @@ export function AddFriendModal({ visible, onClose }: Props) {
           </View>
         )}
       </ThemedView>
+      <QrScannerModal visible={scanOpen} onClose={() => setScanOpen(false)} onCode={onScanned} />
     </Modal>
   );
 }
@@ -149,6 +175,27 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     letterSpacing: 4,
     color: Accent,
+  },
+  qrBlock: {
+    alignItems: 'center',
+    gap: Spacing.two,
+  },
+  qrBox: {
+    // white quiet zone so the QR scans in dark mode too
+    backgroundColor: '#fff',
+    padding: Spacing.three,
+    borderRadius: Spacing.two,
+  },
+  scanButton: {
+    borderWidth: 1,
+    borderColor: Accent,
+    borderRadius: Spacing.two,
+    paddingVertical: Spacing.three,
+    alignItems: 'center',
+  },
+  scanButtonText: {
+    color: Accent,
+    fontWeight: '600',
   },
   centered: {
     textAlign: 'center',

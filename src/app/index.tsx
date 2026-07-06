@@ -1,7 +1,8 @@
 import * as DocumentPicker from 'expo-document-picker';
 import { Image } from 'expo-image';
+import * as Linking from 'expo-linking';
 import * as Sharing from 'expo-sharing';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -347,7 +348,24 @@ function Main() {
   const [addFriendOpen, setAddFriendOpen] = useState(false);
 
   const refreshFriends = useFriends((s) => s.refresh);
+  const redeemCode = useFriends((s) => s.redeemCode);
   const { transfers, loading, refresh } = useTransfers();
+
+  // QR pairing via deep link: zapfileapp://?pair=CODE (system camera scans).
+  const url = Linking.useURL();
+  const handledUrl = useRef<string | null>(null);
+  useEffect(() => {
+    if (!url || url === handledUrl.current) return;
+    handledUrl.current = url;
+    const pair = Linking.parse(url).queryParams?.pair;
+    const code = typeof pair === 'string' ? pair : Array.isArray(pair) ? pair[0] : null;
+    if (!code) return;
+    redeemCode(code)
+      .then(() => Alert.alert('Friend request sent', 'Waiting for them to accept.'))
+      .catch((e) =>
+        Alert.alert('Could not add friend', e instanceof Error ? e.message : 'Invalid code'),
+      );
+  }, [url, redeemCode]);
 
   useEffect(() => {
     const offUp = zapWs.on('ws.connected', () => setWsConnected(true));

@@ -77,17 +77,30 @@ async function rawRequest<T>(path: string, method: string, body?: unknown, token
 }
 
 /** Refreshes the access token once; returns false if the session is truly dead. */
+let refreshInFlight: Promise<boolean> | null = null;
+
 async function tryRefresh(): Promise<boolean> {
+  // several requests 401 together after a wake — they must share one refresh,
+  // or the losers' rotated-away tokens would log the user out
+  if (refreshInFlight) return refreshInFlight;
   if (!refreshToken) return false;
-  try {
-    const auth = await rawRequest<AuthResponse>('/auth/refresh', 'POST', { refreshToken });
-    await saveTokens(auth.accessToken, auth.refreshToken);
-    return true;
-  } catch {
-    await clearTokens();
-    onSessionExpired?.();
-    return false;
-  }
+  refreshInFlight = (async () => {
+    try {
+      const auth = await rawRequest<AuthResponse>('/auth/refresh', 'POST', { refreshToken });
+      await saveTokens(auth.accessToken, auth.refreshToken);
+      return true;
+    } catch (e) {
+      // only a rejected token kills the session — a network blip must not
+      if (e instanceof RequestError && (e.status === 401 || e.status === 403)) {
+        await clearTokens();
+        onSessionExpired?.();
+      }
+      return false;
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+  return refreshInFlight;
 }
 
 /** Authenticated request with a single automatic refresh-and-retry on 401. */

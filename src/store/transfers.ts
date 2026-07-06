@@ -89,6 +89,34 @@ function setBatchStatus(set: SetState, batchId: string, status: TransferResponse
   }));
 }
 
+let refreshInFlight: Promise<void> | null = null;
+
+async function doRefresh() {
+  const { setState: set } = useTransfers;
+  set({ loading: true, error: null });
+  try {
+    const transfers = await api.transferHistory();
+    // The server can briefly lag behind what this device already knows
+    // (final progress / complete calls still in flight), so never move a
+    // transfer backwards: keep local terminal statuses and higher byte
+    // counts until the server catches up.
+    set((s) => ({
+      transfers: transfers.map((t) => {
+        const local = s.transfers.find((x) => x.id === t.id);
+        if (!local) return t;
+        return {
+          ...t,
+          status: TERMINAL.has(local.status) && !TERMINAL.has(t.status) ? local.status : t.status,
+          bytesTransferred: Math.max(t.bytesTransferred, local.bytesTransferred),
+        };
+      }),
+      loading: false,
+    }));
+  } catch (e) {
+    set({ loading: false, error: e instanceof Error ? e.message : 'Could not load transfers' });
+  }
+}
+
 export const useTransfers = create<TransfersState>((set, get) => ({
   transfers: [],
   localFiles: loadJson<Record<string, string>>(LOCAL_FILES_STORE) ?? {},
@@ -97,28 +125,16 @@ export const useTransfers = create<TransfersState>((set, get) => ({
   error: null,
 
   refresh: async () => {
-    set({ loading: true, error: null });
-    try {
-      const transfers = await api.transferHistory();
-      // The server can briefly lag behind what this device already knows
-      // (final progress / complete calls still in flight), so never move a
-      // transfer backwards: keep local terminal statuses and higher byte
-      // counts until the server catches up.
-      set((s) => ({
-        transfers: transfers.map((t) => {
-          const local = s.transfers.find((x) => x.id === t.id);
-          if (!local) return t;
-          return {
-            ...t,
-            status: TERMINAL.has(local.status) && !TERMINAL.has(t.status) ? local.status : t.status,
-            bytesTransferred: Math.max(t.bytesTransferred, local.bytesTransferred),
-          };
-        }),
-        loading: false,
-      }));
-    } catch (e) {
-      set({ loading: false, error: e instanceof Error ? e.message : 'Could not load transfers' });
-    }
+    // concurrent callers (WS event bursts, multi-store reconnect) share one fetch
+    if (refreshInFlight) return refreshInFlight;
+    refreshInFlight = (async () => {
+      try {
+        await doRefresh();
+      } finally {
+        refreshInFlight = null;
+      }
+    })();
+    return refreshInFlight;
   },
 
   sendFiles: async (receiverUserId, files) => {
@@ -203,17 +219,31 @@ const REFETCH_EVENTS = [
   'transfer.resumed',
 ] as const;
 
-for (const event of REFETCH_EVENTS) {
-  zapWs.on(event, () => {
+// A batch offer fans out into one event per transfer — coalesce the burst
+// into a single refetch instead of hammering GET /transfers.
+let refetchTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleRefetch() {
+  if (refetchTimer) return;
+  refetchTimer = setTimeout(() => {
+    refetchTimer = null;
     useTransfers.getState().refresh();
-  });
+  }, 300);
+}
+
+for (const event of REFETCH_EVENTS) {
+  zapWs.on(event, scheduleRefetch);
 }
 
 // Progress is high-frequency: patch in place instead of refetching.
+// The sender's relayed progress runs ahead of the receiver's own byte count
+// (SEND_WINDOW flow control), and both write here — never move backwards,
+// and ignore late pushes once the transfer is terminal.
 zapWs.on('transfer.progress', (data: { transferId: string; bytesTransferred: number }) => {
   useTransfers.setState((s) => ({
     transfers: s.transfers.map((t) =>
-      t.id === data.transferId ? { ...t, bytesTransferred: data.bytesTransferred } : t,
+      t.id === data.transferId && !TERMINAL.has(t.status)
+        ? { ...t, bytesTransferred: Math.max(t.bytesTransferred, data.bytesTransferred) }
+        : t,
     ),
   }));
 });

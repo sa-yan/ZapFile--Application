@@ -5,6 +5,8 @@ type Listener = (data: any) => void;
 
 const PING_INTERVAL_MS = 30_000;
 const MAX_BACKOFF_MS = 30_000;
+/** No pong for this long = half-open socket; force-close so reconnect kicks in. */
+const PONG_TIMEOUT_MS = PING_INTERVAL_MS * 2 + 5_000;
 
 /**
  * Connection to the backend's /ws endpoint: receives server pushes
@@ -20,6 +22,7 @@ class ZapWs {
   private token: string | null = null;
   private deviceId: string | null = null;
   private shouldRun = false;
+  private lastPong = 0;
 
   connect(token: string, deviceId: string) {
     this.token = token;
@@ -67,13 +70,27 @@ class ZapWs {
 
     this.ws.onopen = () => {
       this.backoffMs = 1000;
+      this.lastPong = Date.now();
       this.emit('ws.connected', {});
-      this.pingTimer = setInterval(() => this.send('ping', {}), PING_INTERVAL_MS);
+      this.pingTimer = setInterval(() => {
+        // a silently dropped connection (network handoff, NAT timeout) never
+        // fires onclose — detect it by the missing pongs and close ourselves
+        if (Date.now() - this.lastPong > PONG_TIMEOUT_MS) {
+          console.warn('[ws] no pong, closing half-open socket');
+          this.ws?.close();
+          return;
+        }
+        this.send('ping', {});
+      }, PING_INTERVAL_MS);
     };
 
     this.ws.onmessage = (event) => {
       try {
         const envelope: WsEnvelope = JSON.parse(event.data as string);
+        if (envelope.type === 'pong') {
+          this.lastPong = Date.now();
+          return;
+        }
         this.emit(envelope.type, envelope.data);
       } catch {
         // ignore malformed frames
@@ -84,7 +101,9 @@ class ZapWs {
       this.clearTimers();
       this.emit('ws.disconnected', {});
       if (this.shouldRun) {
-        this.reconnectTimer = setTimeout(() => this.open(), this.backoffMs);
+        // jitter so many clients don't reconnect in lockstep after a backend restart
+        const delay = this.backoffMs * (0.5 + Math.random() * 0.5);
+        this.reconnectTimer = setTimeout(() => this.open(), delay);
         this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
       }
     };

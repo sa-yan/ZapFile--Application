@@ -47,6 +47,13 @@
         }
       ],
       "expo-secure-store",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "ZapFile uses the camera to scan a friend's pairing QR code.",
+          "recordAudioAndroid": false
+        }
+      ],
       "@config-plugins/react-native-webrtc",
       "expo-sharing",
       [

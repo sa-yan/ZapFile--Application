@@ -1,9 +1,5 @@
-import { Directory, File, Paths } from 'expo-file-system';
-import {
-  readAsStringAsync,
-  StorageAccessFramework as SAF,
-  writeAsStringAsync,
-} from 'expo-file-system/legacy';
+import { Directory, File, FileMode, Paths } from 'expo-file-system';
+import { StorageAccessFramework as SAF } from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 import { Platform } from 'react-native';
 
@@ -16,13 +12,18 @@ import {
 
 import * as api from '@/lib/api';
 import { zapWs } from '@/lib/ws';
+import { WS_URL } from '@/config';
 import { useAuth } from '@/store/auth';
 import { useTransfers } from '@/store/transfers';
 import type { TransferResponse } from '@/types/api';
 
 // Peer-to-peer file bytes over a WebRTC data channel. The backend only
 // relays the SDP/ICE signaling (see SignalingHandler.java); once the
-// channel is up, data flows phone-to-phone.
+// channel is up, data flows phone-to-phone. With STUN-only ICE, symmetric
+// and carrier-grade NAT can't be punched — when the peer connection fails
+// (or never connects in time), both sides fall back to the backend's
+// /relay WebSocket (RelayHandler.java), which forwards frames verbatim.
+// The channel protocol below is identical on both pipes.
 //
 // Channel protocol (ordered + reliable, the data channel default):
 //   sender -> receiver: {"kind":"meta",...} JSON, then binary chunks, then {"kind":"done"}
@@ -40,6 +41,10 @@ const SEND_WINDOW = 1024 * 1024;
 const ACK_EVERY = 8 * CHUNK_BYTES;
 const PROGRESS_EVERY_MS = 400;
 const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
+/** Give ICE this long to produce a connection before falling back to the relay. */
+const RELAY_FALLBACK_AFTER_MS = 20_000;
+/** How long the relay waits for the peer device to join before giving up. */
+const RELAY_PEER_JOIN_TIMEOUT_MS = 60_000;
 
 interface Meta {
   kind: 'meta';
@@ -55,11 +60,29 @@ interface Session {
   remoteSet: boolean;
   /** Sender side: bytes the receiver has confirmed writing. */
   acked: number;
+  role: 'sender' | 'receiver';
+  /** Sender context, kept so the transfer can restart over the relay. */
+  transfer?: TransferResponse;
+  uri?: string;
+  relay?: RelayChannel;
+  fallbackTimer?: ReturnType<typeof setTimeout>;
 }
 
 const sessions = new Map<string, Session>();
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// The peer controls fileName; never let it influence the on-disk path.
+function sanitizeFileName(name: unknown): string {
+  const base = String(name ?? '')
+    .split(/[/\\]/)
+    .pop()!
+    .replace(/[\x00-\x1f:*?"<>|]/g, '')
+    .replace(/^\.+/, '')
+    .trim()
+    .slice(0, 200);
+  return base || 'received-file';
+}
 
 // react-native-webrtc's EventTarget types come from event-target-shim, which
 // this TS setup fails to resolve — register handlers through this shim instead.
@@ -72,10 +95,13 @@ const on = (target: unknown, event: string, handler: (e: any) => void) =>
 function cleanup(transferId: string) {
   const s = sessions.get(transferId);
   if (s) {
+    // delete first: the relay's close event must see the session as gone
+    sessions.delete(transferId);
+    if (s.fallbackTimer) clearTimeout(s.fallbackTimer);
     try {
       s.pc.close();
     } catch {}
-    sessions.delete(transferId);
+    s.relay?.close();
   }
 }
 
@@ -88,9 +114,9 @@ async function fail(transferId: string, reason: string) {
   useTransfers.getState().refresh();
 }
 
-function createPeer(transferId: string): RTCPeerConnection {
+function createPeer(transferId: string, role: Session['role']): RTCPeerConnection {
   const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  const session: Session = { pc, pendingCandidates: [], remoteSet: false, acked: 0 };
+  const session: Session = { pc, pendingCandidates: [], remoteSet: false, acked: 0, role };
   sessions.set(transferId, session);
 
   on(pc, 'icecandidate', (event) => {
@@ -103,17 +129,155 @@ function createPeer(transferId: string): RTCPeerConnection {
   });
 
   on(pc, 'connectionstatechange', () => {
-    if (pc.connectionState === 'failed') {
-      fail(transferId, 'peer connection failed');
+    const s = sessions.get(transferId);
+    if (!s || s.relay) return;
+    if (pc.connectionState === 'connected') {
+      if (s.fallbackTimer) {
+        clearTimeout(s.fallbackTimer);
+        s.fallbackTimer = undefined;
+      }
+    } else if (pc.connectionState === 'failed') {
+      switchToRelay(transferId);
     }
   });
+
+  // ICE can also hang without ever reaching "failed" — fall back on a timer too
+  session.fallbackTimer = setTimeout(() => {
+    const s = sessions.get(transferId);
+    if (s && !s.relay && pc.connectionState !== 'connected') {
+      switchToRelay(transferId);
+    }
+  }, RELAY_FALLBACK_AFTER_MS);
 
   return pc;
 }
 
+// --- relay fallback ---
+
+/**
+ * Presents the backend's /relay WebSocket with the same surface pumpFile
+ * and receiveChannel use on an RTCDataChannel (send / addEventListener /
+ * readyState), so the transfer code runs unchanged over either pipe.
+ * "open" fires once BOTH devices have joined the relay; peer protocol
+ * frames (tagged "kind") pass through, server control frames (tagged
+ * "type") are consumed here.
+ */
+class RelayChannel {
+  private ws: WebSocket;
+  private handlers = new Map<string, Set<(e: any) => void>>();
+  readyState: 'connecting' | 'open' | 'closed' = 'connecting';
+  binaryType = 'arraybuffer';
+
+  constructor(transferId: string, token: string, deviceId: string) {
+    this.ws = new WebSocket(
+      `${WS_URL}/relay?token=${token}&deviceId=${deviceId}&transferId=${transferId}`,
+    );
+    (this.ws as any).binaryType = 'arraybuffer';
+    let peerReady = false;
+    this.ws.onmessage = (event) => {
+      if (typeof event.data !== 'string') {
+        this.emit('message', { data: event.data });
+        return;
+      }
+      let msg: any;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (msg.type === 'relay.ready' || msg.type === 'relay.peer-joined') {
+        peerReady = peerReady || msg.type === 'relay.peer-joined' || msg.peerConnected === true;
+        if (peerReady && this.readyState === 'connecting') {
+          this.readyState = 'open';
+          this.emit('open', {});
+        }
+      } else if (msg.type === 'relay.peer-left' || msg.type === 'error') {
+        this.close();
+      } else if (msg.kind) {
+        this.emit('message', { data: event.data });
+      }
+    };
+    this.ws.onclose = () => this.close();
+    this.ws.onerror = () => {}; // onclose follows
+  }
+
+  addEventListener(event: string, handler: (e: any) => void) {
+    if (!this.handlers.has(event)) this.handlers.set(event, new Set());
+    this.handlers.get(event)!.add(handler);
+  }
+
+  private emit(event: string, e: any) {
+    this.handlers.get(event)?.forEach((h) => h(e));
+  }
+
+  send(data: string | Uint8Array) {
+    this.ws.send(data as any);
+  }
+
+  close() {
+    if (this.readyState !== 'closed') {
+      this.readyState = 'closed';
+      this.emit('close', {});
+    }
+    try {
+      this.ws.close();
+    } catch {}
+  }
+}
+
+function switchToRelay(transferId: string) {
+  const session = sessions.get(transferId);
+  if (!session || session.relay) return;
+
+  const token = api.getAccessToken();
+  const deviceId = useAuth.getState().deviceId;
+  if (!token || !deviceId) {
+    fail(transferId, 'peer connection failed and no credentials for relay');
+    return;
+  }
+
+  console.log(`[transfer ${transferId}] P2P failed, falling back to server relay`);
+  if (session.fallbackTimer) clearTimeout(session.fallbackTimer);
+  try {
+    session.pc.close();
+  } catch {}
+  // the transfer restarts from byte 0 over the relay
+  session.acked = 0;
+
+  const relay = new RelayChannel(transferId, token, deviceId);
+  session.relay = relay;
+
+  session.fallbackTimer = setTimeout(() => {
+    if (relay.readyState === 'connecting') relay.close();
+  }, RELAY_PEER_JOIN_TIMEOUT_MS);
+
+  relay.addEventListener('open', () => {
+    const s = sessions.get(transferId);
+    if (s?.fallbackTimer) {
+      clearTimeout(s.fallbackTimer);
+      s.fallbackTimer = undefined;
+    }
+  });
+  relay.addEventListener('close', () => {
+    // cleanup() deletes the session before closing the relay, so a normal
+    // teardown doesn't re-enter here
+    if (sessions.has(transferId)) fail(transferId, 'relay connection closed');
+  });
+
+  if (session.role === 'sender') {
+    if (!session.transfer || !session.uri) {
+      fail(transferId, 'relay fallback missing sender context');
+      return;
+    }
+    wireSenderChannel(relay, session.transfer, session.uri);
+  } else {
+    receiveChannel(relay, transferId);
+  }
+}
+
 async function setRemote(transferId: string, sdp: any) {
   const session = sessions.get(transferId);
-  if (!session) return;
+  if (!session || session.relay) return; // relay took over; pc is closed
   await session.pc.setRemoteDescription(new RTCSessionDescription(sdp));
   session.remoteSet = true;
   for (const c of session.pendingCandidates) {
@@ -132,17 +296,31 @@ async function startSending(transfer: TransferResponse) {
     return;
   }
 
-  const pc = createPeer(transfer.id);
+  const pc = createPeer(transfer.id, 'sender');
+  const session = sessions.get(transfer.id)!;
+  session.transfer = transfer;
+  session.uri = uri;
   const channel = pc.createDataChannel('file');
   channel.binaryType = 'arraybuffer';
+  wireSenderChannel(channel, transfer, uri);
 
+  const offer = await pc.createOffer({});
+  await pc.setLocalDescription(offer);
+  zapWs.send('signal.sdp-offer', { transferId: transfer.id, sdp: offer });
+}
+
+/** Sender-side channel wiring, shared by the data channel and the relay. */
+function wireSenderChannel(channel: any, transfer: TransferResponse, uri: string) {
   on(channel, 'open', () => {
-    pumpFile(channel, transfer, uri).catch((e) =>
-      fail(transfer.id, e instanceof Error ? e.message : 'send failed'),
-    );
+    pumpFile(channel, transfer, uri).catch((e) => {
+      const s = sessions.get(transfer.id);
+      if (!s) return; // torn down (cancel/fail/complete) — state already handled
+      if (s.relay && channel !== s.relay) return; // superseded by relay fallback
+      fail(transfer.id, e instanceof Error ? e.message : 'send failed');
+    });
   });
 
-  on(channel, 'message', (event) => {
+  on(channel, 'message', (event: { data: unknown }) => {
     if (typeof event.data !== 'string') {
       console.log(`[transfer ${transfer.id}] sender got unexpected binary message`);
       return;
@@ -166,10 +344,6 @@ async function startSending(transfer: TransferResponse) {
       }
     } catch {}
   });
-
-  const offer = await pc.createOffer({});
-  await pc.setLocalDescription(offer);
-  zapWs.send('signal.sdp-offer', { transferId: transfer.id, sdp: offer });
 }
 
 async function pumpFile(channel: any, transfer: TransferResponse, uri: string) {
@@ -194,11 +368,22 @@ async function pumpFile(channel: any, transfer: TransferResponse, uri: string) {
       while (sent - (sessions.get(transfer.id)?.acked ?? 0) > SEND_WINDOW) {
         await sleep(20);
         stalledMs += 20;
+        const stalled = sessions.get(transfer.id);
+        // session gone = cancel/fail/complete already handled the state
+        if (!stalled) return;
+        if (stalled.relay && channel !== stalled.relay) return; // superseded by relay fallback
         if (stalledMs >= 15_000) {
-          throw new Error(`no acks from receiver for 15s (sent ${sent}, acked ${sessions.get(transfer.id)?.acked ?? 0})`);
+          if (!stalled.relay) {
+            // acks stopped flowing over P2P — try the relay before giving up
+            switchToRelay(transfer.id);
+            return;
+          }
+          throw new Error(`no acks from receiver for 15s (sent ${sent}, acked ${stalled.acked})`);
         }
       }
-      if (!sessions.get(transfer.id)) throw new Error('session closed mid-send');
+      const session = sessions.get(transfer.id);
+      if (!session) return; // cancel/fail/complete already handled the state
+      if (session.relay && channel !== session.relay) return; // superseded by relay fallback
       const chunk = handle.readBytes(Math.min(CHUNK_BYTES, size - sent));
       if (chunk.length === 0) break;
       channel.send(chunk);
@@ -224,21 +409,21 @@ async function pumpFile(channel: any, transfer: TransferResponse, uri: string) {
 }
 
 const DOWNLOADS_DIR_KEY = 'zapfile.downloadsDirUri';
-/** Base64 copy holds the file in memory; skip enormous files. */
-const MAX_PUBLIC_COPY_BYTES = 128 * 1024 * 1024;
+const COPY_CHUNK_BYTES = 256 * 1024;
 
 /**
  * Copies every received file into the user's Downloads folder so it shows up
  * in the Files app. The first call opens Android's picker pointed at
  * Downloads — the user confirms once; afterwards copies are silent.
+ * Streamed in chunks: SAF content:// URIs support WriteOnly handles, so the
+ * file never has to fit in JS memory.
  */
 async function saveToDownloads(
   uri: string,
   fileName: string,
   mimeType: string | null,
-  size: number,
 ): Promise<boolean> {
-  if (Platform.OS !== 'android' || size > MAX_PUBLIC_COPY_BYTES) return false;
+  if (Platform.OS !== 'android') return false;
   try {
     let dir = await storage.getItem(DOWNLOADS_DIR_KEY);
     if (!dir) {
@@ -250,8 +435,20 @@ async function saveToDownloads(
       await storage.setItem(DOWNLOADS_DIR_KEY, dir);
     }
     const dest = await SAF.createFileAsync(dir, fileName, mimeType ?? 'application/octet-stream');
-    const base64 = await readAsStringAsync(uri, { encoding: 'base64' });
-    await writeAsStringAsync(dest, base64, { encoding: 'base64' });
+    const src = new File(uri).open(FileMode.ReadOnly);
+    const dst = new File(dest).open(FileMode.WriteOnly);
+    try {
+      let remaining = src.size ?? 0;
+      while (remaining > 0) {
+        const chunk = src.readBytes(Math.min(COPY_CHUNK_BYTES, remaining));
+        if (chunk.length === 0) break;
+        dst.writeBytes(chunk);
+        remaining -= chunk.length;
+      }
+    } finally {
+      src.close();
+      dst.close();
+    }
     return true;
   } catch (e) {
     console.warn('downloads save failed:', e instanceof Error ? e.message : e);
@@ -287,18 +484,28 @@ function receiveChannel(channel: any, transferId: string) {
   let lastAck = 0;
 
   channel.binaryType = 'arraybuffer';
+  // if the pipe dies (cancel, peer gone), don't leak the write handle
+  on(channel, 'close', () => {
+    try {
+      handle?.close();
+    } catch {}
+    handle = null;
+  });
   on(channel, 'message', async (event: { data: unknown }) => {
     try {
       if (typeof event.data === 'string') {
         const msg = JSON.parse(event.data);
         if (msg.kind === 'meta') {
           console.log(`[transfer ${transferId}] meta received: ${msg.fileName} (${msg.fileSize} bytes)`);
-          meta = msg;
+          if (!Number.isSafeInteger(msg.fileSize) || msg.fileSize < 0) {
+            throw new Error(`bad fileSize in meta: ${msg.fileSize}`);
+          }
+          meta = { ...msg, fileName: sanitizeFileName(msg.fileName) };
           const dir = new Directory(Paths.document, 'received');
           try {
             dir.create({ intermediates: true });
           } catch {} // already exists
-          file = new File(dir, `${transferId}-${msg.fileName}`);
+          file = new File(dir, `${transferId}-${meta!.fileName}`);
           try {
             file.create({ overwrite: true });
           } catch {}
@@ -308,6 +515,12 @@ function receiveChannel(channel: any, transferId: string) {
           handle = null;
           const doneFile = file;
           const doneMeta = meta;
+          // a short write must never be reported (and saved) as a success
+          if (!doneMeta || received !== doneMeta.fileSize) {
+            throw new Error(
+              `incomplete file: got ${received} of ${doneMeta?.fileSize ?? '?'} bytes`,
+            );
+          }
           if (doneMeta && doneFile) {
             const inGallery = await saveToGallery(doneFile.uri, doneMeta.mimeType);
             // everything also lands in the user's Downloads folder
@@ -315,7 +528,6 @@ function receiveChannel(channel: any, transferId: string) {
               doneFile.uri,
               doneMeta.fileName,
               doneMeta.mimeType,
-              doneMeta.fileSize,
             );
             useTransfers.setState((s) => ({
               receivedFiles: {
@@ -365,7 +577,10 @@ function receiveChannel(channel: any, transferId: string) {
           channel.send(JSON.stringify({ kind: 'ack', received }));
           useTransfers.setState((s) => ({
             transfers: s.transfers.map((t) =>
-              t.id === transferId ? { ...t, status: 'IN_PROGRESS', bytesTransferred: received } : t,
+              t.id === transferId
+                ? // relayed sender progress may already be ahead — don't step back
+                  { ...t, status: 'IN_PROGRESS', bytesTransferred: Math.max(t.bytesTransferred, received) }
+                : t,
             ),
           }));
         }
@@ -378,7 +593,10 @@ function receiveChannel(channel: any, transferId: string) {
 }
 
 async function onSdpOffer(data: { transferId: string; sdp: any }) {
-  const pc = createPeer(data.transferId);
+  const existing = sessions.get(data.transferId);
+  if (existing?.relay) return; // already transferring over the relay
+  if (existing) cleanup(data.transferId); // stale earlier attempt
+  const pc = createPeer(data.transferId, 'receiver');
   on(pc, 'datachannel', (event) => {
     receiveChannel(event.channel, data.transferId);
   });
@@ -442,9 +660,37 @@ zapWs.on('ws.connected', async () => {
   }
 });
 
+// Cancel/decline/fail must tear down a live session, or bytes keep flowing
+// until the file ends. Two hooks: the WS push (fast path, covers the remote
+// side) and a store subscription (covers the local optimistic cancel and the
+// reconnect refetch). COMPLETED is deliberately NOT handled here — the done/
+// received handshake tears those down itself, and killing the channel on the
+// receiver's optimistic COMPLETED write would cut off its final frame.
+const STOP_STATUSES = new Set<TransferResponse['status']>(['CANCELLED', 'DECLINED', 'FAILED']);
+
+function stopSession(transferId: string, why: string) {
+  if (!sessions.has(transferId)) return;
+  console.log(`[transfer ${transferId}] stopping session (${why})`);
+  cleanup(transferId);
+}
+
+for (const event of ['transfer.cancelled', 'transfer.declined', 'transfer.failed'] as const) {
+  zapWs.on(event, (data: any) => {
+    const transfers: any[] = data?.transfers ?? (data?.id ? [data] : []);
+    for (const t of transfers) stopSession(t.id, event);
+    if (typeof data?.transferId === 'string') stopSession(data.transferId, event);
+  });
+}
+
+useTransfers.subscribe((state) => {
+  for (const t of state.transfers) {
+    if (STOP_STATUSES.has(t.status)) stopSession(t.id, t.status);
+  }
+});
+
 zapWs.on('signal.ice-candidate', (data: { transferId: string; candidate: any }) => {
   const session = sessions.get(data.transferId);
-  if (!session) return;
+  if (!session || session.relay) return;
   if (session.remoteSet) {
     session.pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(() => {});
   } else {
