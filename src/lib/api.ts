@@ -133,6 +133,9 @@ export async function login(email: string, password: string): Promise<AuthRespon
 
 export const getMe = () => request<UserResponse>('/users/me');
 
+/** Permanently deletes the account server-side; password re-confirmed by the backend. */
+export const deleteAccount = (password: string) => request<void>('/users/me', 'DELETE', { password });
+
 // --- devices ---
 
 export const listDevices = () => request<DeviceResponse[]>('/devices');

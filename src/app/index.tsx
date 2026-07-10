@@ -18,6 +18,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { AddFriendModal } from '@/components/add-friend-modal';
 import { Avatar } from '@/components/avatar';
+import { DeleteAccountModal } from '@/components/delete-account-modal';
 import { ProgressRing } from '@/components/progress-ring';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -125,7 +126,14 @@ function FriendBubble({ friend }: { friend: FriendResponse }) {
   const [sending, setSending] = useState(false);
 
   const pickAndSend = async () => {
-    const result = await DocumentPicker.getDocumentAsync({ multiple: true });
+    // copyToCacheDirectory:false is essential — the default (true) copies the
+    // whole picked file into the app cache before returning, which is slow and
+    // fails outright for large files. We stream straight from the original
+    // content:// URI instead (the expo-file-system File API reads SAF URIs).
+    const result = await DocumentPicker.getDocumentAsync({
+      multiple: true,
+      copyToCacheDirectory: false,
+    });
     if (result.canceled || result.assets.length === 0) return;
     setSending(true);
     try {
@@ -346,6 +354,7 @@ function Main() {
   const logout = useAuth((s) => s.logout);
   const [wsConnected, setWsConnected] = useState(zapWs.connected);
   const [addFriendOpen, setAddFriendOpen] = useState(false);
+  const [deleteAccountOpen, setDeleteAccountOpen] = useState(false);
 
   const refreshFriends = useFriends((s) => s.refresh);
   const redeemCode = useFriends((s) => s.redeemCode);
@@ -448,8 +457,15 @@ function Main() {
             settled.map((t) => <HistoryItem key={t.id} transfer={t} myUserId={user.userId} />)
           )}
         </View>
+
+        <Pressable style={styles.deleteAccountLink} onPress={() => setDeleteAccountOpen(true)}>
+          <ThemedText type="small" style={{ color: '#e5484d' }}>
+            Delete account
+          </ThemedText>
+        </Pressable>
       </ScrollView>
       <AddFriendModal visible={addFriendOpen} onClose={() => setAddFriendOpen(false)} />
+      <DeleteAccountModal visible={deleteAccountOpen} onClose={() => setDeleteAccountOpen(false)} />
     </>
   );
 }
@@ -513,6 +529,11 @@ const styles = StyleSheet.create({
   },
   section: {
     gap: Spacing.three,
+  },
+  deleteAccountLink: {
+    alignSelf: 'center',
+    paddingVertical: Spacing.three,
+    marginTop: Spacing.four,
   },
   bubbleRow: {
     gap: Spacing.four,

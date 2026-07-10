@@ -64,6 +64,12 @@ interface Session {
   /** Sender context, kept so the transfer can restart over the relay. */
   transfer?: TransferResponse;
   uri?: string;
+  /**
+   * Strong refs to the source File and its read handle. Without these the
+   * GC frees the native objects mid-transfer and the fd dies underneath us
+   * ("Bad file descriptor" from readBytes, roughly every GC cycle).
+   */
+  src?: { file: File; handle: ReturnType<File['open']> };
   relay?: RelayChannel;
   fallbackTimer?: ReturnType<typeof setTimeout>;
 }
@@ -346,9 +352,35 @@ function wireSenderChannel(channel: any, transfer: TransferResponse, uri: string
   });
 }
 
+/**
+ * Opens `file` for reading positioned at `offset`. Seeks when the handle
+ * supports it; some streaming content:// providers can't seek, so fall back
+ * to reading and discarding until the offset is reached.
+ */
+function openReaderAt(file: File, offset: number) {
+  const handle = file.open(FileMode.ReadOnly);
+  if (offset > 0) {
+    try {
+      handle.offset = offset;
+    } catch {}
+    let at = handle.offset ?? 0;
+    while (at < offset) {
+      const skipped = handle.readBytes(Math.min(256 * 1024, offset - at));
+      if (skipped.length === 0) {
+        handle.close();
+        throw new Error(`could not reposition to ${offset} (stuck at ${at})`);
+      }
+      at += skipped.length;
+    }
+  }
+  return handle;
+}
+
 async function pumpFile(channel: any, transfer: TransferResponse, uri: string) {
   const file = new File(uri);
-  const size = file.size;
+  // file.size can be null for some content:// (SAF) URIs; fall back to the
+  // size the picker reported when the offer was created.
+  const size = file.size ?? transfer.fileSize;
   const meta: Meta = {
     kind: 'meta',
     fileName: transfer.fileName,
@@ -357,7 +389,15 @@ async function pumpFile(channel: any, transfer: TransferResponse, uri: string) {
   };
   channel.send(JSON.stringify(meta));
 
-  const handle = file.open();
+  // ReadOnly: the picker now hands us the original content:// (SAF) URI, and
+  // SAF URIs don't support the default ReadWrite open mode.
+  let handle = openReaderAt(file, 0);
+  // pin the native objects on the session so the GC can't close the fd
+  const rootSrc = (f: File, h: typeof handle) => {
+    const s = sessions.get(transfer.id);
+    if (s) s.src = { file: f, handle: h };
+  };
+  rootSrc(file, handle);
   let sent = 0;
   let lastProgress = 0;
   console.log(`[transfer ${transfer.id}] channel open, sending ${size} bytes`);
@@ -384,9 +424,38 @@ async function pumpFile(channel: any, transfer: TransferResponse, uri: string) {
       const session = sessions.get(transfer.id);
       if (!session) return; // cancel/fail/complete already handled the state
       if (session.relay && channel !== session.relay) return; // superseded by relay fallback
-      const chunk = handle.readBytes(Math.min(CHUNK_BYTES, size - sent));
+      const want = Math.min(CHUNK_BYTES, size - sent);
+      let chunk: Uint8Array;
+      try {
+        chunk = handle.readBytes(want);
+      } catch (e) {
+        // The native fd can go stale mid-transfer ("Bad file descriptor"),
+        // typically right after a flow-control stall. Reopen the source and
+        // resume from the exact byte where the old handle died.
+        console.warn(
+          `[transfer ${transfer.id}] readBytes failed at ${sent}/${size}, reopening:`,
+          e instanceof Error ? e.message : e,
+        );
+        try {
+          handle.close();
+        } catch {}
+        try {
+          const fresh = new File(uri);
+          handle = openReaderAt(fresh, sent);
+          rootSrc(fresh, handle);
+          chunk = handle.readBytes(want);
+        } catch (e2) {
+          throw new Error(
+            `readBytes failed at ${sent}/${size} even after reopen: ${e2 instanceof Error ? e2.message : e2}`,
+          );
+        }
+      }
       if (chunk.length === 0) break;
-      channel.send(chunk);
+      try {
+        channel.send(chunk);
+      } catch (e) {
+        throw new Error(`channel.send failed at ${sent}/${size}: ${e instanceof Error ? e.message : e}`);
+      }
       sent += chunk.length;
 
       const now = Date.now();

@@ -21,6 +21,8 @@ interface AuthState {
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string, displayName: string) => Promise<void>;
   logout: () => Promise<void>;
+  /** Deletes the account on the server, then clears all local session state. Throws on failure. */
+  deleteAccount: (password: string) => Promise<void>;
 }
 
 /** Registers this phone as a device (once) and returns its id. */
@@ -110,6 +112,15 @@ export const useAuth = create<AuthState>((set) => ({
     zapWs.disconnect();
     await api.clearTokens();
     set({ user: null, error: null });
+  },
+
+  deleteAccount: async (password) => {
+    await api.deleteAccount(password); // throws if the password is wrong
+    zapWs.disconnect();
+    await api.clearTokens();
+    // the device row is gone server-side; a future login must register fresh
+    await storage.deleteItem(DEVICE_KEY);
+    set({ user: null, deviceId: null, error: null });
   },
 }));
 

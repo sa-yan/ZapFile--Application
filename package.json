@@ -1,5 +1,5 @@
 {
-  "name": "zapfile-app",
+  "name": "zapfile",
   "main": "expo-router/entry",
   "version": "1.0.0",
   "dependencies": {
