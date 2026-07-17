@@ -27,7 +27,18 @@
         "android.permission.RECORD_AUDIO",
         "android.permission.SYSTEM_ALERT_WINDOW",
         "android.permission.WAKE_LOCK",
-        "android.permission.BLUETOOTH"
+        "android.permission.BLUETOOTH",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_AUDIO"
+      ],
+      "blockedPermissions": [
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"
       ],
       "package": "com.sayan2209.ZapFileapp",
       "googleServicesFile": "./google-services.json"
@@ -71,8 +82,9 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "58cd1767-43c0-47c5-bcbd-7f57523d3343"
+        "projectId": "d0a8bc22-2894-4f26-8961-2152800fb62e"
       }
-    }
+    },
+    "owner": "hello3338"
   }
 }

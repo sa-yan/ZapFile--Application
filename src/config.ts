@@ -9,5 +9,5 @@
 //   API_URL = 'http://192.168.x.x:8081/api'
 //   WS_URL  = 'ws://192.168.x.x:8081'
 
-export const API_URL = 'https://zapfile-backend.onrender.com/api';
-export const WS_URL = 'wss://zapfile-backend.onrender.com';
+export const API_URL = 'https://p01--zapfile--26vyzwtbt9gz.code.run/api';
+export const WS_URL = 'wss://p01--zapfile--26vyzwtbt9gz.code.run';
